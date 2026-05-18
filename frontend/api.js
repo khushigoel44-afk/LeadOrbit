@@ -1,4 +1,9 @@
-const API_BASE = 'http://localhost:8000/api/v1';
+const storedApiBase = localStorage.getItem('api_base_url');
+const isLocalhost = ['localhost', '127.0.0.1'].includes(window.location.hostname);
+const defaultApiBase = isLocalhost
+    ? 'http://127.0.0.1:8000/api/v1'
+    : 'https://leadorbit.onrender.com/api/v1';
+const API_BASE = (storedApiBase || defaultApiBase).replace(/\/$/, '');
 
 export const setTokens = (access, refresh) => {
     localStorage.setItem('access_token', access);
@@ -27,10 +32,28 @@ export const fetchWithAuth = async (endpoint, options = {}) => {
         delete headers['Content-Type'];
     }
 
-    const response = await fetch(`${API_BASE}${endpoint}`, {
-        ...options,
-        headers
-    });
+    const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 20000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    let response;
+    try {
+        response = await fetch(`${API_BASE}${endpoint}`, {
+            ...options,
+            headers,
+            signal: options.signal || controller.signal,
+        });
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            throw new Error('Request timed out. Check if the backend is running on port 8000.');
+        }
+        if (error instanceof TypeError) {
+            throw new Error(`Cannot reach backend API at ${API_BASE}. Check that the backend server is running.`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeoutId);
+    }
 
     if (response.status === 401) {
         // Handle token refresh logic here in production

@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from .ai import personalize_email
 from .gmail_service import check_for_replies, send_gmail
+from .sms_service import send_sms, initiate_call
 from .models import CampaignLead, SequenceStep
 
 logger = logging.getLogger(__name__)
@@ -150,18 +151,25 @@ def _execute_non_email_step(clead, step, now=None):
     if step.channel_type == 'CONDITION_REPLY':
         _execute_condition_reply_step(clead, step, now=now)
         return
-    if step.channel_type in {'CONDITION_OPEN', 'CONDITION_CLICK'}:
-        logger.info(
-            f"Condition step {step.channel_type} has no event source configured. "
-            f"Continuing sequence for {clead.lead.email}."
-        )
-        _advance_to_next_step(clead, step, now=now)
+    if step.channel_type == 'CONDITION_OPEN':
+        _execute_condition_open_step(clead, step, now=now)
+        return
+    if step.channel_type == 'CONDITION_CLICK':
+        _execute_condition_click_step(clead, step, now=now)
+        return
+    if step.channel_type == 'SMS':
+        _execute_sms_step(clead, step, now=now)
+        return
+    if step.channel_type == 'CALL':
+        _execute_call_step(clead, step, now=now)
         return
     logger.info(f"Auto-advancing non-email step {step.channel_type} for {clead.lead.email}")
     _advance_to_next_step(clead, step, now=now)
 
 
 def _detect_reply_for_campaign_lead(clead):
+    if clead.last_replied_at:
+        return True
     if clead.status == "REPLIED":
         return True
 
@@ -181,6 +189,47 @@ def _detect_reply_for_campaign_lead(clead):
     return clead.last_sent_message_id in replies
 
 
+def _execute_condition_event_step(clead, step, event_detected, now=None):
+    now = now or timezone.now()
+    raw_steps = _get_campaign_raw_steps(clead.campaign)
+    yes_branch_step_order = _find_branch_step_order(raw_steps, step.step_order, 'yes')
+    no_branch_step_order = _find_branch_step_order(raw_steps, step.step_order, 'no')
+
+    if event_detected:
+        if yes_branch_step_order and yes_branch_step_order > step.step_order:
+            steps = _get_campaign_steps(clead.campaign)
+            yes_step = next((s for s in steps if s.step_order == yes_branch_step_order), None)
+            if yes_step:
+                _activate_step(clead, yes_step, now=now)
+                return
+        _advance_to_next_step(clead, step, now=now)
+        return
+
+    if no_branch_step_order and no_branch_step_order > step.step_order:
+        steps = _get_campaign_steps(clead.campaign)
+        no_step = next((s for s in steps if s.step_order == no_branch_step_order), None)
+        if no_step:
+            _activate_step(clead, no_step, now=now)
+            return
+    # If there is no explicit "no" branch, end the sequence for this lead.
+    clead.current_step = None
+    clead.next_execution_time = None
+    clead.status = 'FINISHED'
+    clead.save(update_fields=['current_step', 'next_execution_time', 'status'])
+    _maybe_mark_campaign_completed(clead.campaign)
+    return
+
+
+def _execute_condition_open_step(clead, step, now=None):
+    event_detected = clead.last_opened_at is not None
+    _execute_condition_event_step(clead, step, event_detected, now=now)
+
+
+def _execute_condition_click_step(clead, step, now=None):
+    event_detected = clead.last_clicked_at is not None
+    _execute_condition_event_step(clead, step, event_detected, now=now)
+
+
 def _execute_condition_reply_step(clead, step, now=None):
     """
     CONDITION_REPLY behavior:
@@ -193,6 +242,9 @@ def _execute_condition_reply_step(clead, step, now=None):
     no_branch_step_order = _find_branch_step_order(raw_steps, step.step_order, 'no')
 
     has_reply = _detect_reply_for_campaign_lead(clead)
+    if has_reply and not clead.last_replied_at:
+        clead.last_replied_at = now
+        clead.save(update_fields=['last_replied_at'])
 
     logger.info(
         f"Reply condition evaluated for {clead.lead.email} | status={clead.status} | result={has_reply}"
@@ -211,6 +263,18 @@ def _execute_condition_reply_step(clead, step, now=None):
                 )
                 return
 
+            # Sequence settings indicate a Yes branch, but SequenceStep rows may
+            # still be out of sync after a campaign edit. Keep the lead active
+            # and retry instead of terminating as REPLIED.
+            clead.status = 'ACTIVE'
+            clead.next_execution_time = now + timedelta(minutes=5)
+            clead.save(update_fields=['status', 'next_execution_time'])
+            logger.warning(
+                f"Reply condition matched for {clead.lead.email} but step order "
+                f"{yes_branch_step_order} was not found; retrying soon."
+            )
+            return
+
         clead.status = "REPLIED"
         clead.current_step = None
         clead.next_execution_time = None
@@ -219,6 +283,17 @@ def _execute_condition_reply_step(clead, step, now=None):
         _maybe_mark_campaign_completed(clead.campaign)
         return
 
+    # Respect the configured condition window (step.delay_minutes).
+    # Before the window expires, keep waiting on this step.
+    if clead.next_execution_time and clead.next_execution_time > now:
+        logger.info(
+            f"Reply condition still waiting for {clead.lead.email}; "
+            f"next check at {clead.next_execution_time}."
+        )
+        return
+
+    # Condition window expired — route to "no" branch or finish.
+    logger.info(f"Reply window expired for {clead.lead.email}")
     if no_branch_step_order and no_branch_step_order > step.step_order:
         steps = _get_campaign_steps(clead.campaign)
         no_step = next((s for s in steps if s.step_order == no_branch_step_order), None)
@@ -230,6 +305,80 @@ def _execute_condition_reply_step(clead, step, now=None):
                 f"routing to No branch step {no_step.step_order}."
             )
             return
+    clead.current_step = None
+    clead.next_execution_time = None
+    clead.status = 'FINISHED'
+    clead.save(update_fields=['current_step', 'next_execution_time', 'status'])
+    _maybe_mark_campaign_completed(clead.campaign)
+    return
+
+
+def _personalize_text(template, lead):
+    """Replace merge tags in SMS/call text with lead data."""
+    if not template:
+        return template
+    replacements = {
+        '{{firstName}}': lead.first_name or '',
+        '{{lastName}}': lead.last_name or '',
+        '{{email}}': lead.email or '',
+        '{{company}}': lead.company or '',
+    }
+    text = template
+    for tag, value in replacements.items():
+        text = text.replace(tag, value)
+    return text
+
+
+def _execute_sms_step(clead, step, now=None):
+    """Send an SMS to the lead's phone number via Twilio."""
+    now = now or timezone.now()
+    phone = getattr(clead.lead, 'phone', None) or ''
+    if not phone:
+        logger.warning(f"No phone number for {clead.lead.email}; skipping SMS step.")
+        _advance_to_next_step(clead, step, now=now)
+        return
+
+    body = _personalize_text(step.template_body or '', clead.lead)
+    if not body:
+        logger.warning(f"Empty SMS body for {clead.lead.email}; skipping.")
+        _advance_to_next_step(clead, step, now=now)
+        return
+
+    try:
+        sid = send_sms(phone, body)
+        logger.info(f"SMS sent to {clead.lead.email} ({phone}) | sid={sid}")
+    except Exception as err:
+        logger.error(f"SMS send failed for {clead.lead.email}: {err}")
+        # Retry later
+        clead.next_execution_time = now + timedelta(minutes=15)
+        clead.save(update_fields=['next_execution_time'])
+        return
+
+    _advance_to_next_step(clead, step, now=now)
+
+
+def _execute_call_step(clead, step, now=None):
+    """
+    Execute a phone call step. If Twilio credentials are configured,
+    initiates an automated call. Otherwise logs as a manual task.
+    """
+    now = now or timezone.now()
+    phone = getattr(clead.lead, 'phone', None) or ''
+    if not phone:
+        logger.warning(f"No phone number for {clead.lead.email}; skipping CALL step.")
+        _advance_to_next_step(clead, step, now=now)
+        return
+
+    call_script = _personalize_text(step.template_body or '', clead.lead)
+
+    try:
+        sid = initiate_call(phone, call_script or None)
+        logger.info(f"Call initiated to {clead.lead.email} ({phone}) | sid={sid}")
+    except RuntimeError:
+        # Twilio not configured — treat as manual step
+        logger.info(f"CALL step (manual) for {clead.lead.email} ({phone}): {call_script or 'No script'}")
+    except Exception as err:
+        logger.error(f"Call failed for {clead.lead.email}: {err}")
 
     _advance_to_next_step(clead, step, now=now)
 
@@ -247,6 +396,19 @@ def send_email_step(campaign_lead_id, step_id):
             _execute_non_email_step(clead, step)
             return
 
+        # Atomic guard: claim this send by nullifying next_execution_time.
+        # Only one concurrent caller can win; prevents duplicate sends.
+        claimed = CampaignLead.objects.filter(
+            id=campaign_lead_id,
+            current_step_id=step_id,
+            next_execution_time__isnull=False,
+        ).update(next_execution_time=None)
+        if not claimed:
+            logger.info(
+                f"Skipping duplicate send for {clead.lead.email} on step {step.step_order}"
+            )
+            return
+
         subject, body = personalize_email(step.template_subject, step.template_body, clead.lead)
 
         account = clead.campaign.connected_account
@@ -258,10 +420,9 @@ def send_email_step(campaign_lead_id, step_id):
                 logger.info(f"Gmail SENT to {clead.lead.email} | msg_id={message_id}")
             except Exception as gmail_err:
                 logger.error(f"Gmail API send failed for {clead.lead.email}: {gmail_err}")
-                # Keep the lead on the same email step and retry later instead of advancing sequence.
-                clead.status = 'ACTIVE'
+                # Restore next_execution_time so the lead can be retried later.
                 clead.next_execution_time = timezone.now() + timedelta(minutes=15)
-                clead.save(update_fields=['status', 'next_execution_time'])
+                clead.save(update_fields=['next_execution_time'])
                 return
         else:
             logger.info(f"Mock SENDING EMAIL to {clead.lead.email} | Subject: {subject}")
@@ -388,10 +549,35 @@ def poll_gmail_for_replies():
                     campaign_branching_cache[campaign_id] = uses_reply_yes_branch
 
                 if uses_reply_yes_branch:
+                    clead.last_replied_at = timezone.now()
+                    clead.save(update_fields=['last_replied_at'])
+                    total_replies += 1
                     logger.info(
                         f"Reply detected for {clead.lead.email} in campaign {clead.campaign.name}; "
-                        "deferring status change to CONDITION_REPLY branch handling."
+                        "marked last_replied_at for CONDITION_REPLY branch."
                     )
+
+                    # If currently parked on CONDITION_REPLY, execute branch routing now
+                    # so the follow-up email can be sent immediately.
+                    if clead.current_step and clead.current_step.channel_type == 'CONDITION_REPLY':
+                        _execute_condition_reply_step(clead, clead.current_step, now=timezone.now())
+                    elif clead.status in {'FINISHED', 'REPLIED'}:
+                        # Recovery path: if the lead was already closed before reply was detected,
+                        # re-open it at CONDITION_REPLY and evaluate the yes/no routing.
+                        condition_step = (
+                            SequenceStep.objects.filter(
+                                campaign=clead.campaign,
+                                channel_type='CONDITION_REPLY',
+                            )
+                            .order_by('step_order')
+                            .first()
+                        )
+                        if condition_step:
+                            clead.current_step = condition_step
+                            clead.status = 'ACTIVE'
+                            clead.next_execution_time = timezone.now()
+                            clead.save(update_fields=['current_step', 'status', 'next_execution_time'])
+                            _execute_condition_reply_step(clead, condition_step, now=timezone.now())
                     continue
 
                 clead.status = 'REPLIED'
