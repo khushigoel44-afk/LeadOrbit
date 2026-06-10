@@ -1,5 +1,5 @@
 
-import { fetchWithAuth, clearTokens } from './api.js';
+import { fetchWithAuth, clearTokens, refreshAccessToken } from './api.js';
 
 const THEME_STORAGE_KEY = 'theme';
 
@@ -40,7 +40,83 @@ function clearSessionTimers() {
 }
 
 function showSessionTimeoutModal() {
-    console.log("Session timeout modal opened");
+    const modalEl = document.getElementById('sessionTimeoutModal');
+
+    if (!modalEl || !window.bootstrap) {
+        console.warn('Session timeout modal not found');
+        return;
+    }
+
+    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+
+    const stayLoggedInBtn = document.getElementById('sessionStayLoggedInBtn');
+
+    if (stayLoggedInBtn && !stayLoggedInBtn.dataset.bound) {
+        stayLoggedInBtn.dataset.bound = 'true';
+
+        stayLoggedInBtn.addEventListener('click', async () => {
+            try {
+                await refreshAccessToken();
+
+                document.activeElement?.blur();
+                modal.hide();
+
+                scheduleSessionWarning();
+
+                console.log('Session refreshed successfully');
+            } catch (error) {
+                console.error(error);
+
+                clearTokens();
+                window.location.href = '/login.html';
+            }
+        });
+    }
+
+    modal.show();
+}
+
+
+function injectSessionTimeoutModal() {
+    if (document.getElementById('sessionTimeoutModal')) {
+        return;
+    }
+
+    const modalHTML = `
+        <div class="modal fade" id="sessionTimeoutModal" tabindex="-1" aria-labelledby="sessionTimeoutModalLabel" aria-hidden="true">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="sessionTimeoutModalLabel">
+                            Session Expiring Soon
+                        </h5>
+                    </div>
+
+                    <div class="modal-body">
+                        Your session will expire in approximately 2 minutes.
+
+                        Would you like to stay logged in?
+                    </div>
+
+                    <div class="modal-footer">
+                        <button type="button"
+                                class="btn btn-secondary"
+                                id="sessionLogoutBtn">
+                            Log Out
+                        </button>
+
+                        <button type="button"
+                                class="btn btn-primary"
+                                id="sessionStayLoggedInBtn">
+                            Stay Logged In
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.insertAdjacentHTML('beforeend', modalHTML);
 }
 
 function scheduleSessionWarning() {
@@ -176,6 +252,22 @@ if (document.readyState === 'loading') {
 document.addEventListener('DOMContentLoaded', async () => {
     initThemeToggle();
     initPasswordVisibilityToggle();
+    injectSessionTimeoutModal();
+
+    document.addEventListener('click', (event) => {
+    if (event.target.id === 'sessionLogoutBtn') {
+        clearSessionTimers();
+        clearTokens();
+
+    const modalEl = document.getElementById('sessionTimeoutModal');
+    if (modalEl && window.bootstrap) {
+        bootstrap.Modal.getOrCreateInstance(modalEl).hide();
+    }
+
+    window.location.href = '/login.html';
+
+    }
+    });
 
     if (window.location.pathname.includes('login.html') || window.location.pathname.includes('register.html')) {
         return;
@@ -225,9 +317,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (logoutBtn) {
         logoutBtn.addEventListener('click', (e) => {
             e.preventDefault();
+            clearSessionTimers();
             clearTokens();
             window.location.href = '/login.html';
-        });
+    });
     }
     // Responsive sidebar toggle
     const hamburgerBtn = document.getElementById('hamburger-btn');
