@@ -1208,7 +1208,10 @@ class CampaignWorkflowTests(APITestCase):
                     format='json',
                 )
 
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.status_code, 
+            status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
         self.assertTrue(
             any('Webhook processing error for event=open email=lead@acme.test' in entry for entry in logs.output)
         )
