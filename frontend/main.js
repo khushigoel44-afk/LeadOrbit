@@ -1,4 +1,5 @@
-import { fetchWithAuth, clearTokens } from './api.js';
+
+import { fetchWithAuth, clearTokens, refreshAccessToken } from './api.js';
 
 const THEME_STORAGE_KEY = 'theme';
 const LEADORBIT_VERSION = 'v1.0.0-beta';
@@ -7,6 +8,151 @@ const LEADORBIT_REPO_URL = 'https://github.com/Kuldeeep18/LeadOrbit';
 // ==========================================
 // THEME MANAGEMENT
 // ==========================================
+
+function decodeJwt(token) {
+    try {
+        const payload = token.split('.')[1];
+        return JSON.parse(atob(payload));
+    } catch {
+        return null;
+    }
+}
+
+function getTokenExpiryTime() {
+    const token = localStorage.getItem('access_token');
+    if (!token) return null;
+
+    const decoded = decodeJwt(token);
+    if (!decoded?.exp) return null;
+
+    return decoded.exp * 1000;
+}
+
+
+let sessionWarningTimer = null;
+let sessionLogoutTimer = null;
+
+
+function clearSessionTimers() {
+    if (sessionWarningTimer) {
+        clearTimeout(sessionWarningTimer);
+        sessionWarningTimer = null;
+    }
+
+    if (sessionLogoutTimer) {
+        clearTimeout(sessionLogoutTimer);
+        sessionLogoutTimer = null;
+    }
+}
+
+function showSessionTimeoutModal() {
+    const modalEl = document.getElementById('sessionTimeoutModal');
+
+    if (!modalEl || !window.bootstrap) {
+        console.warn('Session timeout modal not found');
+        return;
+    }
+
+    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+
+    const stayLoggedInBtn = document.getElementById('sessionStayLoggedInBtn');
+
+    if (stayLoggedInBtn && !stayLoggedInBtn.dataset.bound) {
+        stayLoggedInBtn.dataset.bound = 'true';
+
+        stayLoggedInBtn.addEventListener('click', async () => {
+            try {
+                await refreshAccessToken();
+
+                document.activeElement?.blur();
+                modal.hide();
+
+                scheduleSessionWarning();
+
+                console.log('Session refreshed successfully');
+            } catch (error) {
+                console.error(error);
+
+                clearTokens();
+                window.location.href = '/login.html';
+            }
+        });
+    }
+
+    modal.show();
+}
+
+
+function injectSessionTimeoutModal() {
+    if (document.getElementById('sessionTimeoutModal')) {
+        return;
+    }
+
+    const modalHTML = `
+        <div class="modal fade" id="sessionTimeoutModal" tabindex="-1" aria-labelledby="sessionTimeoutModalLabel" aria-hidden="true">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="sessionTimeoutModalLabel">
+                            Session Expiring Soon
+                        </h5>
+                    </div>
+
+                    <div class="modal-body">
+                        Your session will expire in approximately 2 minutes.
+
+                        Would you like to stay logged in?
+                    </div>
+
+                    <div class="modal-footer">
+                        <button type="button"
+                                class="btn btn-secondary"
+                                id="sessionLogoutBtn">
+                            Log Out
+                        </button>
+
+                        <button type="button"
+                                class="btn btn-primary"
+                                id="sessionStayLoggedInBtn">
+                            Stay Logged In
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.insertAdjacentHTML('beforeend', modalHTML);
+}
+
+function scheduleSessionWarning() {
+    const expiryTime = getTokenExpiryTime();
+
+    if (!expiryTime) return;
+
+    clearSessionTimers();
+
+    const now = Date.now();
+    const warningTime = expiryTime - (2 * 60 * 1000);
+
+    const warningDelay = warningTime - now;
+    const logoutDelay = expiryTime - now;
+
+    console.log('Session warning in:', warningDelay);
+    console.log('Auto logout in:', logoutDelay);
+
+    sessionWarningTimer = setTimeout(() => {
+    showSessionTimeoutModal();
+    }, Math.max(0, warningDelay));
+
+    sessionLogoutTimer = setTimeout(() => {
+    clearSessionTimers();
+    clearTokens();
+    window.location.href = '/login.html';
+    }, Math.max(0, logoutDelay));
+}
+
+
 
 export function getTheme() {
     const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
@@ -222,6 +368,22 @@ async function initAppShell() {
 
     initThemeToggle();
     initPasswordVisibilityToggle();
+    injectSessionTimeoutModal();
+
+    document.addEventListener('click', (event) => {
+    if (event.target.id === 'sessionLogoutBtn') {
+        clearSessionTimers();
+        clearTokens();
+
+    const modalEl = document.getElementById('sessionTimeoutModal');
+    if (modalEl && window.bootstrap) {
+        bootstrap.Modal.getOrCreateInstance(modalEl).hide();
+    }
+
+    window.location.href = '/login.html';
+
+    }
+    });
 
     if (window.location.pathname.includes('login.html') || window.location.pathname.includes('register.html')) {
         return;
@@ -262,6 +424,9 @@ async function initAppShell() {
             }
         }
 
+        console.log("Scheduling session warning...");
+        scheduleSessionWarning();
+
     } catch (e) {
         console.error('Error loading user profile:', e);
     }
@@ -270,9 +435,10 @@ async function initAppShell() {
     if (logoutBtn) {
         logoutBtn.addEventListener('click', (e) => {
             e.preventDefault();
+            clearSessionTimers();
             clearTokens();
             window.location.href = '/login.html';
-        });
+    });
     }
     
     // Responsive sidebar toggle
