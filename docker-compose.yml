@@ -21,9 +21,6 @@ services:
             - My_Network_new
         volumes: 
             - .:/app
-        environment:
-            - CELERY_BROKER_URL=redis://redis:6379/0
-            - CELERY_TASK_ALWAYS_EAGER=false
         depends_on:
             - redis
 
@@ -36,9 +33,6 @@ services:
 
     celery_worker:
         build: .
-        environment:
-            - CELERY_TASK_ALWAYS_EAGER=false
-            - PYTHONPATH=/app/backend
         networks: 
             - My_Network_new
         volumes: 
@@ -53,9 +47,6 @@ services:
 
     beat_scheduler:
         build: .
-        environment:
-            - CELERY_TASK_ALWAYS_EAGER=false
-            - PYTHONPATH=/app/backend
         networks: 
             - My_Network_new
         volumes: 
